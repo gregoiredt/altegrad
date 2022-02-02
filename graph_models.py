@@ -64,6 +64,11 @@ class SageModel(nn.Module):
         h = self.conv2(mfgs[1], (h, h_dst))
         return h
 
+    def get_hidden(self, graph, x):
+        h = F.relu(self.conv1(graph, x))
+        h = self.conv2(graph, h)
+        return h
+
 class DotPredictor(nn.Module):
     '''
     Reconstructs the adjacency matirx value
@@ -81,11 +86,11 @@ class DotPredictor(nn.Module):
 
 ################# UTILS FUNCTIONS #######################
 
-def inference(model, graph, sampler, train_dataloader, device):
+def inference(model, train_dataloader):
     with torch.no_grad():
 
         result = []
-        for _, _, mfgs in train_dataloader:
+        for _, _, _, mfgs in train_dataloader:
             # feature copy from CPU to GPU takes place here
             inputs = mfgs[0].srcdata['feat']
             result.append(model(mfgs, inputs))
