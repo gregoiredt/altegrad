@@ -2,7 +2,8 @@ import networkx as nx
 import numpy as np
 from random import randint
 import dgl
-
+import torch
+import csv
 
 def read_graph():
     G = nx.read_edgelist('edgelist.txt', delimiter=',', create_using=nx.Graph(), nodetype=int)
@@ -60,6 +61,21 @@ def get_dgl_graph(G, features):
     #graph.ndata['feat'] = features
     
     return graph
+
+
+def retrieve_embeddings(G, embeddings):
+    node_pairs = list()
+    with open('test.txt', 'r') as f:
+        for line in f:
+            t = line.split(',')
+            node_pairs.append((int(t[0]), int(t[1])))
+    x = torch.zeros((len(node_pairs), 2*embeddings.shape[1]))
+    for i, (src, dst) in enumerate(node_pairs):
+        src_emb = embeddings[G.nodes[src].data['_ID']]
+        dst_emb = embeddings[G.nodes[dst].data['_ID']]
+        line = torch.cat([src_emb, dst_emb], dim=1)
+        x[i,:] = line
+    return x
 
 
 

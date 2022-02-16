@@ -2,52 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import dgl
-from dgl.nn import SAGEConv
+from dgl.nn import SAGEConv, GATConv
 import dgl.function as fn
 import numpy as np 
 
 import sklearn.metrics
 
-class GNN(nn.Module):
-    def __init__(self, input_dim, hidden_dim_1, hidden_dim_2, hidden_dim_3, n_class, device):
-        super(GNN, self).__init__()
-        self.device = device
-        self.fc1 = nn.Linear(input_dim, hidden_dim_1)
-        self.fc2 = nn.Linear(hidden_dim_1, hidden_dim_2)
-        self.fc3 = nn.Linear(hidden_dim_2, hidden_dim_3)
-        self.fc4 = nn.Linear(hidden_dim_3, n_class)
-        self.relu = nn.ReLU()
-
-    def forward(self, x_in, adj, idx):
-        
-        x = self.relu(torch.mm(adj, self.fc1(x_in)))
-        x = torch.mm(adj, self.fc2(x))
-        
-        idx = idx.unsqueeze(1).repeat(1, x.size(1))
-        out = torch.zeros(torch.max(idx)+1, x.size(1)).to(self.device)
-        out = out.scatter_add_(0, idx, x) 
-
-        out = self.relu(self.fc3(out))
-        out = self.fc4(out)
-
-        return F.log_softmax(out, dim=1)
-
-class GAE(nn.Module):
-    """GAE model"""
-    def __init__(self, in_feats, h_feats):
-        super(GAE, self).__init__()
-
-        self.conv1 = SAGEConv(in_feats, h_feats, aggregator_type='mean')
-        self.conv2 = SAGEConv(h_feats, h_feats, aggregator_type='mean')
-        self.h_feats = h_feats
-        
-    def forward(self, mfgs, x):
-        h_dst = x[:mfgs[0].num_dst_nodes()] # First flow
-        h = self.conv1(mfgs[0], (x, h_dst))
-        h = F.relu(h)
-        h_dst = h[:mfgs[1].num_dst_nodes()] # Second flow
-        h = self.conv2(mfgs[1], (h, h_dst))
-        return h
 
 class SageModel(nn.Module):
     def __init__(self, in_feats, h_feats):
@@ -69,9 +29,63 @@ class SageModel(nn.Module):
         h = self.conv2(graph, h)
         return h
 
+
+class GATModel(nn.Module):
+    def __init__(self, in_feats, h_feats, num_heads, nonlinearity):
+        super(GATModel, self).__init__()
+        self.gat1 = GATConv(in_feats, h_feats, num_heads)
+        self.gat2 = GATConv(h_feats * num_heads, h_feats, num_heads)
+        #self.gat3 = GATConv(h_feats * num_heads, h_feats)
+        self.h_feats = h_feats
+        self.nonlinearity = nonlinearity
+        self.num_heads = num_heads
+
+    def forward(self, mfgs, x):
+        h_dst = x[:mfgs[0].num_dst_nodes()]
+        h = self.gat1(mfgs[0], (x, h_dst))
+        h = h.view(-1, h.size(1) * h.size(2))
+        h = self.nonlinearity(h)
+        h_dst = h[:mfgs[1].num_dst_nodes()]
+        h = self.gat2(mfgs[1], (h, h_dst))
+        h = torch.mean(h, dim=1)
+        return h
+
+    def get_hidden(self, graph, x):
+        with torch.no_grad():
+            h = F.relu(self.gat1(graph, x))
+            h = self.gat2(graph, h)
+        return h
+
+class GraphAttentionModel(nn.Module):
+    def __init__(self, g, n_layers, num_heads, input_size, hidden_size, output_size, nonlinearity):
+        super().__init__()
+        self.num_heads = num_heads
+        self.g = g
+        self.n_layers = n_layers
+        self.nonlinearity = nonlinearity
+        self.layers = nn.ModuleList()
+        self.gat1 = GATConv(input_size, hidden_size, num_heads)
+        self.gat2 = GATConv(hidden_size * num_heads, hidden_size, num_heads)
+        self.gat3 = GATConv(hidden_size * num_heads, output_size, num_heads=num_heads+2)
+
+    def forward(self, inputs):
+        outputs = inputs
+        outputs = self.gat1(self.g, outputs)
+        outputs = outputs.view(-1, outputs.size(1) * outputs.size(2)) # (in_feat, num_heads, out_dim) -> (in_feat, num_heads * out_dim)
+        outputs = self.nonlinearity(outputs)
+
+        outputs = self.gat2(self.g, outputs)
+        outputs = outputs.view(-1, outputs.size(1) * outputs.size(2)) # (in_feat, num_heads, out_dim) -> (in_feat, num_heads * out_dim)
+        outputs = self.nonlinearity(outputs)
+
+        outputs = self.gat3(self.g, outputs)
+        outputs = torch.mean(outputs, dim=1)
+        return outputs
+
+
 class DotPredictor(nn.Module):
     '''
-    Reconstructs the adjacency matirx value
+    Reconstructs the adjacency matrix value
      thanks to the embedding h of the given graph
     '''
     def forward(self, g, h):
@@ -83,6 +97,23 @@ class DotPredictor(nn.Module):
             # u_dot_v returns a 1-element vector for each edge so you need to squeeze it.
             return g.edata['score'][:, 0]
 
+class MLP(nn.Module):
+    def __init__(self, n_hidden, n_input) -> None:
+        super(MLP, self).__init__()
+        self.n_hidden = n_hidden
+        self.n_input = n_input
+        self.f1 = nn.Linear(n_input, n_hidden)
+        self.f2 = nn.Linear(n_hidden, n_hidden)
+        self.f3 = nn.Linear(n_hidden, 1)
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
+        self.dropout = nn.Dropout(p=0.5)
+
+    def forward(self, x):
+        x = self.relu(self.f1(x))
+        x = self.dropout(self.relu(self.f2(x)))
+        output = self.f3(x)
+        return output
 
 ################# UTILS FUNCTIONS #######################
 

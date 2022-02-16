@@ -54,6 +54,7 @@ clf = LogisticRegression()
 clf.fit(X_train, y_train)
 y_pred = clf.predict_proba(X_test)
 y_pred = y_pred[:,1]
+print(y_pred)
 
 # Write predictions to a file
 predictions = zip(range(len(y_pred)), y_pred)
