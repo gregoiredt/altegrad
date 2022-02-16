@@ -5,7 +5,7 @@ import dgl
 from dgl.nn import SAGEConv, GATConv
 import dgl.function as fn
 import numpy as np 
-
+from tqdm import tqdm
 import sklearn.metrics
 
 
@@ -52,35 +52,53 @@ class GATModel(nn.Module):
 
     def get_hidden(self, graph, x):
         with torch.no_grad():
-            h = F.relu(self.gat1(graph, x))
+            h = self.gat1(graph, x)
+            h = h.view(-1, h.size(1) * h.size(2))
+            h = self.nonlinearity(h)
+            
             h = self.gat2(graph, h)
+            h = torch.mean(h, dim=1)
         return h
 
-class GraphAttentionModel(nn.Module):
-    def __init__(self, g, n_layers, num_heads, input_size, hidden_size, output_size, nonlinearity):
-        super().__init__()
-        self.num_heads = num_heads
-        self.g = g
-        self.n_layers = n_layers
+class DeepGAT(nn.Module):
+    def __init__(self, in_feats, h_feats, num_heads, nonlinearity):
+        super(DeepGAT, self).__init__()
+        self.gat1 = GATConv(in_feats, h_feats, num_heads)
+        self.gat2 = GATConv(h_feats * num_heads, h_feats, num_heads)
+        self.gat3 = GATConv(h_feats * num_heads, h_feats, num_heads+2)
+        self.h_feats = h_feats
         self.nonlinearity = nonlinearity
-        self.layers = nn.ModuleList()
-        self.gat1 = GATConv(input_size, hidden_size, num_heads)
-        self.gat2 = GATConv(hidden_size * num_heads, hidden_size, num_heads)
-        self.gat3 = GATConv(hidden_size * num_heads, output_size, num_heads=num_heads+2)
+        self.num_heads = num_heads
 
-    def forward(self, inputs):
-        outputs = inputs
-        outputs = self.gat1(self.g, outputs)
-        outputs = outputs.view(-1, outputs.size(1) * outputs.size(2)) # (in_feat, num_heads, out_dim) -> (in_feat, num_heads * out_dim)
-        outputs = self.nonlinearity(outputs)
+    def forward(self, mfgs, x):
+        h_dst = x[:mfgs[0].num_dst_nodes()]
+        h = self.gat1(mfgs[0], (x, h_dst))
+        h = h.view(-1, h.size(1) * h.size(2))
+        h = self.nonlinearity(h)
 
-        outputs = self.gat2(self.g, outputs)
-        outputs = outputs.view(-1, outputs.size(1) * outputs.size(2)) # (in_feat, num_heads, out_dim) -> (in_feat, num_heads * out_dim)
-        outputs = self.nonlinearity(outputs)
+        h_dst = h[:mfgs[1].num_dst_nodes()]
+        h = self.gat2(mfgs[1], (h, h_dst))
+        h = h.view(-1, h.size(1) * h.size(2))
+        h = self.nonlinearity(h)
 
-        outputs = self.gat3(self.g, outputs)
-        outputs = torch.mean(outputs, dim=1)
-        return outputs
+        h_dst = h[:mfgs[2].num_dst_nodes()]
+        h = self.gat3(mfgs[2], (h, h_dst))
+        h = torch.mean(h, dim=1)
+        return h
+
+    def get_hidden(self, graph, x):
+        with torch.no_grad():
+            h = self.gat1(graph, x)
+            h = h.view(-1, h.size(1) * h.size(2))
+            h = self.nonlinearity(h)
+
+            h = self.gat2(graph, x)
+            h = h.view(-1, h.size(1) * h.size(2))
+            h = self.nonlinearity(h)
+
+            h = self.gat3(graph, h)
+            h = torch.mean(h, dim=1)
+        return h
 
 
 class DotPredictor(nn.Module):
@@ -129,35 +147,76 @@ def inference(model, train_dataloader):
         return torch.cat(result)
 
 
-def evaluate(emb, label, train_nids, valid_nids, test_nids, num_classes, device):
-    classifier = nn.Linear(emb.shape[1], num_classes).to(device)
-    opt = torch.optim.LBFGS(classifier.parameters())
+def train_classif(
+    model, 
+    embeddings, 
+    train_dataloader, 
+    val_dataloader, 
+    criterion, 
+    device,
+    optimizer, 
+    epochs=10, 
+    name_model='c1.pt'
+    ):
 
-    def compute_loss():
-        pred = classifier(emb[train_nids].to(device))
-        loss = F.cross_entropy(pred, label[train_nids].to(device))
-        return loss
+    best_model_path = name_model
+    min_loss=np.inf
+    for epoch in range(epochs):
+        train_losses = []
+        val_losses = []
+        with tqdm(train_dataloader) as tq:
+            for step, (input_nodes, pos_graph, neg_graph, _) in enumerate(tq):
+                with torch.no_grad():
+                    src, dst = pos_graph.edges()
+                    src_emb = embeddings[pos_graph.nodes[src].data['_ID']]
+                    dst_emb = embeddings[pos_graph.nodes[dst].data['_ID']]
+                    x = torch.cat([src_emb, dst_emb], dim=1)
+                    n_pos = x.shape[0]
 
-    def closure():
-        loss = compute_loss()
-        opt.zero_grad()
-        loss.backward()
-        return loss
+                    src_neg, dst_neg = neg_graph.edges()
+                    src_emb_neg = embeddings[neg_graph.nodes[src_neg].data['_ID']]
+                    dst_emb_neg = embeddings[neg_graph.nodes[dst_neg].data['_ID']]
+                    x_neg = torch.cat([src_emb_neg, dst_emb_neg], dim=1)
+                    n_neg = x_neg.shape[0]
+                    
+                x_tot = torch.cat([x, x_neg], dim=0).to(device)
+                y = model(x_tot)
+                
+                pos_label = torch.ones(n_pos)
+                target = torch.cat([pos_label, torch.zeros(n_neg)]).to(device)
 
-    prev_loss = float('inf')
-    for i in range(1000):
-        opt.step(closure)
-        with torch.no_grad():
-            loss = compute_loss().item()
-            if np.abs(loss - prev_loss) < 1e-4:
-                print('Converges at iteration', i)
-                break
-            else:
-                prev_loss = loss
+                loss = criterion(y.squeeze(), target)
+                train_losses.append(loss.item())
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                tq.set_postfix({'loss': '%.03f' % loss.item()}, refresh=False)
+        
 
-    with torch.no_grad():
-        pred = classifier(emb.to(device)).cpu()
-        label = label
-        valid_acc = sklearn.metrics.accuracy_score(label[valid_nids].numpy(), pred[valid_nids].numpy().argmax(1))
-        test_acc = sklearn.metrics.accuracy_score(label[test_nids].numpy(), pred[test_nids].numpy().argmax(1))
-    return valid_acc, test_acc
+        for step, (input_nodes, pos_graph, neg_graph, _) in enumerate(val_dataloader):
+            with torch.no_grad():
+                src, dst = pos_graph.edges()
+                src_emb = embeddings[pos_graph.nodes[src].data['_ID']]
+                dst_emb = embeddings[pos_graph.nodes[dst].data['_ID']]
+                x = torch.cat([src_emb, dst_emb], dim=1)
+                n_pos = x.shape[0]
+
+                src_neg, dst_neg = neg_graph.edges()
+                src_emb_neg = embeddings[neg_graph.nodes[src_neg].data['_ID']]
+                dst_emb_neg = embeddings[neg_graph.nodes[dst_neg].data['_ID']]
+                x_neg = torch.cat([src_emb_neg, dst_emb_neg], dim=1)
+                n_neg = x_neg.shape[0]
+                
+                x_tot = torch.cat([x, x_neg], dim=0).to(device)
+                y = model(x_tot)
+            
+                pos_label = torch.ones(n_pos)
+                target = torch.cat([pos_label, torch.zeros(n_neg)]).to(device)
+
+                loss = criterion(y.squeeze(), target)
+                val_losses.append(loss.item())
+        
+        if np.mean(val_losses) < min_loss:
+            min_loss = np.mean(val_losses)
+            torch.save(model.state_dict(), best_model_path)
+        print(f'Epoch {epoch} : Train mean loss {np.mean(train_losses)} : Val mean loss {np.mean(val_losses)}')

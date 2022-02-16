@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import dgl
+from sklearn.model_selection import train_test_split
 
 def normalize_adjacency(A):
 
@@ -64,3 +65,8 @@ def random_edge(n):
         a = np.random.randint(n)
         b = np.random.randint(n)
     return a,b
+
+def edge_train_val_split(G, val_size=0.1):
+    eids = G.edges(form='eid')
+    eid_train, eid_val = train_test_split(eids, test_size=val_size)
+    return eid_train, eid_val
