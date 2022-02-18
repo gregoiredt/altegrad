@@ -133,6 +133,28 @@ class MLP(nn.Module):
         output = self.f3(x)
         return output
 
+class TwoChannelsMLP(nn.Module):
+    def __init__(self, n_hidden, n_input) -> None:
+        super(MLP, self).__init__()
+        self.n_hidden = n_hidden
+        self.n_input = n_input
+        self.f1 = nn.Linear(n_input, n_hidden)
+        self.f1_prime = nn.Linear(n_input, n_hidden)
+        self.f2 = nn.Linear(2*n_hidden, 2*n_hidden)
+        self.f3 = nn.Linear(2*n_hidden, 1)
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
+        self.dropout = nn.Dropout(p=0.5)
+
+    def forward(self, x):
+        x1 = self.dropout(self.relu(self.f1(x[:,:self.n_input])))
+        x2 = self.dropout(self.relu(self.f1_prime(x[:,self.n_input:])))
+        h = torch.cat([x1, x2], dim=1)
+        h = self.dropout(self.relu(self.f2(h)))
+        output = self.f3(h)
+        return output
+
+
 ################# UTILS FUNCTIONS #######################
 
 def inference(model, train_dataloader):
